@@ -2,11 +2,11 @@
 #include <ESP32Time.h>
 #include "BluetoothSerial.h"
 #include "WiFi.h" 
+#include "time.h"
 
 #include <ESPmDNS.h>
 #include <WiFiUdp.h>
 #include <ArduinoOTA.h>
-
 
 #if !defined(CONFIG_BT_ENABLED) || !defined(CONFIG_BLUEDROID_ENABLED)
 #error Bluetooth is not enabled! Please run `make menuconfig` to and enable it
@@ -27,6 +27,13 @@
 #define THU 0x04
 #define FRI 0x02
 #define SAT 0x01
+
+
+//Define ntp server config
+const char* ntpServer = "pool.ntp.org";
+const long gmtOffset_sec = -3*60*60;  //bs as time
+const int daylightOffset_sec = 3600;
+
 
 //Define the timer for checking Alarm
 hw_timer_t *My_timer = NULL;
@@ -73,18 +80,31 @@ alarm_t alarm1;
 //Set BT
 BluetoothSerial SerialBT;
 
+
+
+//Get the current time in the ntp
+void getNTPTime(){
+    struct tm t;
+    configTime(gmtOffset_sec, daylightOffset_sec, ntpServer);
+    if(getLocalTime(&t)) rtc.setTimeStruct(t); //the rtc will be set only if the getlocaltime worked
+}
 ///////////////////////////////////////////
 //Interrupt of the timer 
 //   100ms
 
 long lastState =0; //Aux variable for the last state of the alarmIsBeforeNow function
 
+unsigned int alarm_int=0;
 //callback function when timer is up
 void IRAM_ATTR onTimer(){
+    alarm_int++;
+}
     
     //todo: The logic that checks the alarm needs to be improved. its not so clean
-   
+ 
 
+//this runs when the alarm interrupt is true  
+void process_alarm_int(){
     //Starts the alarm
     if (!lastState && alarmIsBeforeNow(alarm1) && !alarm1.progress) alarm1.progress+=100;    
     
@@ -234,28 +254,28 @@ void printNetworkCredentials(){
 //Scan Wifi networks and print them in the Bluetooth Serial
 //void scanWifi(BluetoothSerial Serial){
 void scanWifi(){
-  Serial.println("scan start");
+  SerialBT.println("scan start");
 
   // WiFi.scanNetworks will return the number of networks found
   int n = WiFi.scanNetworks();
-  Serial.println("scan done");
+  SerialBT.println("scan done");
   if (n == 0) {
-      Serial.println("no networks found");
+      SerialBT.println("no networks found");
   } else {
-    Serial.print(n);
-    Serial.println(" networks found");
+    SerialBT.print(n);
+    SerialBT.println(" networks found");
     for (int i = 0; i < n; ++i) {
       // Print SSID and RSSI for each network found
-      Serial.print(i + 1);
-      Serial.print(": ");
-      Serial.println(WiFi.SSID(i));
-      Serial.print(" (");
-      Serial.print(WiFi.RSSI(i));
-      Serial.println(")");
-      Serial.println((WiFi.encryptionType(i) == WIFI_AUTH_OPEN)?" ":"*");
+      SerialBT.print(i + 1);
+      SerialBT.print(": ");
+      SerialBT.println(WiFi.SSID(i));
+      SerialBT.print(" (");
+      SerialBT.print(WiFi.RSSI(i));
+      SerialBT.println(")");
+      SerialBT.println((WiFi.encryptionType(i) == WIFI_AUTH_OPEN)?" ":"*");
     }
   }
-  Serial.println("");
+  SerialBT.println("");
          
 }      
 
@@ -288,8 +308,23 @@ void startWifi(){
         } 
         Serial.println(WiFi.localIP());
         SerialBT.println(WiFi.localIP()); 
-     } 
+     }
+}
 
+
+
+//LCD Light Status
+bool LCDLight= false;
+
+//Switch LCD Light
+void switchLCDLight(){
+    if (LCDLight){
+        LCDLight=false;
+        lcd.noBacklight();
+    } else { 
+       LCDLight=true;
+       lcd.backlight();
+   }
 }
 
 void setup(){
@@ -303,16 +338,15 @@ void setup(){
     lcd.setCursor(0,0);
     lcd.print("Starting ...");
     
-    // turn on LCD backlight                  
-    lcd.backlight();
-    //lcd.noBacklight();
+    // turn off LCD backlight                  
+    lcd.noBacklight();
     
     //Start Serial
     Serial.begin(115200);
     
     //Set RTC   --- todo: this should be deleted once sntp is established
     rtc.setTime(0, 0, 12, 1, 1, 2023);   
-   
+    
     //Print in LCD the BT
     //lcd.setCursor(0, 0);
     //lcd.print(rtc.getTime("%A, %B %d %Y %H:%M:%S"));
@@ -337,9 +371,6 @@ void setup(){
     // Intialize the WIFI Preferences   
     startWifi();
     
-  
-    
-    
     //set the timer that checks the alarm
     pinMode(LED, OUTPUT);   //Set the led as the outut for the timer
     My_timer = timerBegin(0, 80, true);
@@ -351,13 +382,17 @@ void setup(){
     Timer_LCD = timerBegin(1, 80, true);
     timerAttachInterrupt(Timer_LCD, &onTimerLCD, true);
     timerAlarmWrite(Timer_LCD, 1000000, true);
-    timerAlarmEnable(Timer_LCD); //Just Enable
-    
-    
+    timerAlarmEnable(Timer_LCD); //Just Enable   
+
+    //get and set the time from the ntp
+    getNTPTime();
+     
+     //Initialize the value of the aux flag lastState
+    lastState=alarmIsBeforeNow(alarm1);
 
     //Start OTA       
     ArduinoOTA.begin();
-    
+
 } 
 
 
@@ -386,6 +421,8 @@ void loop() {
                       splitString(input, ' ', 6).toInt()
                    ); 
                    SerialBT.println(rtc.getTime("%A, %B %d %Y %H:%M:%S"));
+              //Update value of the aux flag lastState after the time change
+              lastState=alarmIsBeforeNow(alarm1);
                    break;
               //Print Alarm
               case 'a':
@@ -430,6 +467,9 @@ void loop() {
                    preferences.end();       
             
                    BTSerialPrintAlarm();  //it prints the alam on the BTSerial
+
+                  //Update value of the aux flag lastState after the alarm time change
+                   lastState=alarmIsBeforeNow(alarm1);
                    break;
               //Restart the ESP
               case 'r':
@@ -448,28 +488,46 @@ void loop() {
                    SerialBT.println("Local IP: ");
                    SerialBT.println(WiFi.localIP());
                    break;
-              //Help Section        
+              //Switch dispñay light on off
+              case 'l':
+                   switchLCDLight();
+                   break;
+              //Update date with ntp time
+              case 'u':
+                   getNTPTime();
+                   SerialBT.println(rtc.getTime("%A, %B %d %Y %H:%M:%S"));
+                    //Update value of the aux flag lastState after the time change
+                   lastState=alarmIsBeforeNow(alarm1);
+              //Help Section 
+            
+                   break;       
               case 'h': 
               default:
                    SerialBT.println(             
-                       "The command is incorrect :(\n"
-                       "Please try:\n"
+                       "Usage:\n"
                        "p - Print current time\n"
                        "a - Print alarm\n"
                        "s %s %m %h %D %M %Y - Set current time\n"
                        "q %h %m %s %duration - Set alarm\n"
-                       "d - Scan and display all the available WiFi networks (currently display over the USB bus)\n"
+                       "d - Scan and display all the available WiFi networks\n"
                        "y - Print network credentials\n"
                        "x %ssid %pass - Set network credentials (NOTE: please add an extra space after password)\n" //TODO we need to fix this
                        "i - Print local IP\n"
                        "c - Connect to Wifi\n"
-                       "r - Restart ESP32\n"            
+                       "r - Restart ESP32\n"  
+                       "l - Turn on/off LCD Light\n" 
+                       "u - Update Date with NTP time\n"         
             );
     }
   }
   if (timeToPrint){
         timeToPrint=false;
         printLCD();
+  }
+    
+  if (alarm_int>0){ 
+       alarm_int--;
+       process_alarm_int(); 
   }
   ArduinoOTA.handle();    
   delay(20);
